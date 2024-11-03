@@ -1,0 +1,155 @@
+import asyncio
+import logging
+from datetime import datetime, timedelta
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext
+from azure.cognitiveservices.vision.computervision import ComputerVisionClient
+from msrest.authentication import CognitiveServicesCredentials
+
+TOKEN = "7581823582:AAFPr2CrwFTp7kCbH8YZU0gev-n26-YdPkI"
+ADMIN_ID = 1348307617
+
+AZURE_ENDPOINT = "ВАШ_КОНЕЧНЫЙ_АДРЕС"
+AZURE_KEY = "ВАШ_КЛЮЧ_API"
+
+computervision_client = ComputerVisionClient(AZURE_ENDPOINT, CognitiveServicesCredentials(AZURE_KEY))
+
+last_message_time = {}
+confirmation_sent = set()
+user_requests = {}
+banned_users = {}
+
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+
+async def start(update: Update, context: CallbackContext):
+    await update.message.reply_text(
+        "Привет! Этот чат предназначен для подачи апелляций. "
+        "Пожалуйста, укажите свой ник и опишите свою ситуацию. "
+        "Чат анонимен, поэтому не беспокойтесь о конфиденциальности. "
+        "Не отправляйте запрещённый контент."
+    )
+
+async def handle_feedback(update: Update, context: CallbackContext):
+    user_id = update.message.from_user.id
+    user_name = update.message.from_user.full_name
+    username = update.message.from_user.username
+    current_time = datetime.now()
+    
+    if user_id in banned_users:
+        ban_time, ban_until = banned_users[user_id]
+        if current_time < ban_until:
+            remaining_time = (ban_until - current_time).seconds
+            await update.message.reply_text(f"Заблокированы на {remaining_time // 60} мин и {remaining_time % 60} сек.")
+            return
+        else:
+            del banned_users[user_id]
+
+    if user_id in last_message_time:
+        time_since_last_message = current_time - last_message_time[user_id]
+        if time_since_last_message < timedelta(seconds=50):
+            new_ban_until = current_time + timedelta(hours=1)
+            banned_until = banned_users.get(user_id, (current_time, current_time))
+            if new_ban_until > banned_until[1]:
+                banned_users[user_id] = (current_time, new_ban_until)
+                await update.message.reply_text("Слишком часто. Блокировка на 1 час.")
+            return
+
+    last_message_time[user_id] = current_time
+
+    sent = False
+
+    async def send_confirmation(success):
+        if success and user_id not in confirmation_sent:
+            await update.message.reply_text("✉️")
+            confirmation_sent.add(user_id)
+        elif not success:
+            await update.message.reply_text("❌")
+
+    async def analyze_image(image_url):
+        analysis = computervision_client.analyze_image(image_url, visual_features=["Adult"])
+        return analysis.adult.is_adult_content or analysis.adult.is_racy_content
+
+    try:
+        if update.message.text:
+            user_requests[user_id] = user_requests.get(user_id, 0) + 1
+            await context.bot.send_message(chat_id=ADMIN_ID, text=f"Запрос от {user_name} (@{username}, ID: {user_id}):\n\n{update.message.text}")
+            sent = True
+        elif update.message.photo:
+            user_requests[user_id] = user_requests.get(user_id, 0) + 1
+            photo = update.message.photo[-1]
+            photo_file = await context.bot.get_file(photo.file_id)
+            photo_url = photo_file.file_path
+            if await analyze_image(photo_url):
+                await update.message.reply_text("Нежелательный контент. Заблокированы на 1 день.")
+                banned_users[user_id] = (current_time, current_time + timedelta(days=1))
+                await update.message.reply_text("Вот песня для вас: https://youtu.be/ShmpspBio7U?si=0jJy_0ffQyqJRqs2")
+            else:
+                await context.bot.send_photo(chat_id=ADMIN_ID, photo=photo.file_id, caption=f"{user_name} (@{username}, ID: {user_id}) отправил фото.")
+                sent = True
+        elif update.message.animation:
+            user_requests[user_id] = user_requests.get(user_id, 0) + 1
+            animation = update.message.animation
+            await context.bot.send_animation(chat_id=ADMIN_ID, animation=animation.file_id, caption=f"{user_name} (@{username}, ID: {user_id}) отправил GIF.")
+            sent = True
+        elif update.message.sticker:
+            user_requests[user_id] = user_requests.get(user_id, 0) + 1
+            sticker = update.message.sticker
+            await context.bot.send_sticker(chat_id=ADMIN_ID, sticker=sticker.file_id, caption=f"{user_name} (@{username}, ID: {user_id}) отправил стикер.")
+            sent = True
+    except Exception as e:
+        logging.error(f"Ошибка: {e}")
+    
+    await send_confirmation(sent)
+
+    if not sent:
+        await asyncio.sleep(72 * 60 * 60)
+        await send_confirmation(False)
+
+async def stats(update: Update, context: CallbackContext):
+    if update.message.from_user.id != ADMIN_ID:
+        await update.message.reply_text("Нет доступа.")
+        return
+
+    stats_message = "Статистика:\n"
+    for user_id, count in user_requests.items():
+        stats_message += f"{user_id}: {count} запросов\n"
+
+    await update.message.reply_text(stats_message)
+
+async def reset(update: Update, context: CallbackContext):
+    if update.message.from_user.id != ADMIN_ID:
+        await update.message.reply_text("Нет доступа.")
+        return
+
+    user_requests.clear()
+    confirmation_sent.clear()
+    last_message_time.clear()
+    banned_users.clear()
+    
+    await update.message.reply_text("Данные сброшены.")
+
+async def broadcast(update: Update, context: CallbackContext):
+    if update.message.from_user.id != ADMIN_ID:
+        await update.message.reply_text("Нет доступа.")
+        return
+
+    message = " ".join(context.args)
+    if not message:
+        await update.message.reply_text("Укажите сообщение.")
+        return
+
+    for user_id in user_requests.keys():
+        await context.bot.send_message(chat_id=user_id, text=message)
+
+    await update.message.reply_text("Уведомления отправлены.")
+
+def main():
+    application = Application.builder().token(TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_feedback))
+
+    application.run_polling()
+
+if __name__ == "__main__":
+    main()
