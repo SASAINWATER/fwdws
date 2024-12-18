@@ -1,155 +1,447 @@
-import asyncio
+import re
+import time
 import logging
-from datetime import datetime, timedelta
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext
-from azure.cognitiveservices.vision.computervision import ComputerVisionClient
-from msrest.authentication import CognitiveServicesCredentials
+import asyncio
+import nest_asyncio
+from collections import defaultdict
+from difflib import SequenceMatcher
+from telegram import Update, ChatPermissions
+from telegram.ext import Application, MessageHandler, filters
 
-TOKEN = "7581823582:AAFPr2CrwFTp7kCbH8YZU0gev-n26-YdPkI"
-ADMIN_ID = 1348307617
+# Применение nest_asyncio для исправления проблем с циклом событий в Pydroid
+nest_asyncio.apply()
 
-AZURE_ENDPOINT = "ВАШ_КОНЕЧНЫЙ_АДРЕС"
-AZURE_KEY = "ВАШ_КЛЮЧ_API"
+# Настройка логирования
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
 
-computervision_client = ComputerVisionClient(AZURE_ENDPOINT, CognitiveServicesCredentials(AZURE_KEY))
+# Константы
+BOT_USERNAME = "TomorrowlyBot"
+BOT_INVITE_URL = f"https://t.me/{BOT_USERNAME}?startgroup=true"
+TOKEN = "7693473797:AAFTLPjkrIOOSdObSFtBCgKXjRKG3NtBEpg"  # Замените на свой токен
+USER_LIMIT = 7
+TIME_WINDOW_SHORT = 4
+TIME_WINDOW_LONG = 90
+MUTE_DURATION = 1800
+WARNING_TIME_LIMIT = 2
 
-last_message_time = {}
-confirmation_sent = set()
-user_requests = {}
-banned_users = {}
+# Структуры данных
+user_message_data = defaultdict(list)
+user_warnings = defaultdict(int)
+locked_message_types = {
+    "photo": False,
+    "sticker": False,
+    "audio": False,
+    "video": False,
+    "document": False,
+    "text": False
+}
+auto_messages = defaultdict(list)
+auto_job_handles = {}
 
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+# Функции для обработки сообщений
+def similar(a: str, b: str) -> float:
+    return SequenceMatcher(None, a, b).ratio()
 
-async def start(update: Update, context: CallbackContext):
-    await update.message.reply_text(
-        "Привет! Этот чат предназначен для подачи апелляций. "
-        "Пожалуйста, укажите свой ник и опишите свою ситуацию. "
-        "Чат анонимен, поэтому не беспокойтесь о конфиденциальности. "
-        "Не отправляйте запрещённый контент."
-    )
+def has_similar_pattern(message_text: str) -> bool:
+    cleaned_text = re.sub(r'[^a-zA-Z0-9]', '', message_text.lower())
+    if len(cleaned_text) < 4:
+        return False
+    for i in range(len(cleaned_text) - 3):
+        substring = cleaned_text[i:i + 4]
+        if cleaned_text.count(substring) > 1:
+            return True
+    return False
 
-async def handle_feedback(update: Update, context: CallbackContext):
-    user_id = update.message.from_user.id
-    user_name = update.message.from_user.full_name
-    username = update.message.from_user.username
-    current_time = datetime.now()
-    
-    if user_id in banned_users:
-        ban_time, ban_until = banned_users[user_id]
-        if current_time < ban_until:
-            remaining_time = (ban_until - current_time).seconds
-            await update.message.reply_text(f"Заблокированы на {remaining_time // 60} мин и {remaining_time % 60} сек.")
-            return
+def contains_spammy_patterns(message_text: str) -> bool:
+    emojis = re.findall(r'[^\w\s,]', message_text)
+    urls = re.findall(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\,]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', message_text)
+    return len(emojis) > 5 or len(urls) > 1
+
+# Обработчик анти-спама
+async def anti_spam(update: Update, context) -> None:
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    message_id = update.message.message_id
+    message_text = update.message.text
+
+    current_time = time.time()
+    user_message_data[user_id].append({"time": current_time, "text": message_text})
+
+    # Удаляем старые сообщения, чтобы они не влияли на статистику
+    user_message_data[user_id] = [
+        msg for msg in user_message_data[user_id]
+        if current_time - msg["time"] <= TIME_WINDOW_LONG
+    ]
+
+    recent_messages = [
+        msg for msg in user_message_data[user_id]
+        if current_time - msg["time"] <= TIME_WINDOW_SHORT
+    ]
+
+    if len(recent_messages) >= 4:
+        user_warnings[user_id] += 1
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+            logger.info(f"Сообщение удалено от пользователя {user_id} в чате {chat_id}.")
+        except Exception as e:
+            logger.warning(f"Не удалось удалить сообщение: {e}")
+
+        if user_warnings[user_id] == 1:
+            if update.message.is_respondable():
+                await update.message.reply_text(
+                    f"@{update.effective_user.username or 'user'}, пожалуйста, избегайте слишком частых сообщений. Это ваше первое предупреждение."
+                )
+
+        elif user_warnings[user_id] == WARNING_TIME_LIMIT:
+            try:
+                permissions = ChatPermissions(can_send_messages=False)
+                until_date = int(current_time + MUTE_DURATION)
+                await context.bot.restrict_chat_member(
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    permissions=permissions,
+                    until_date=until_date,
+                )
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"Пользователь @{update.effective_user.username or 'user'} был замучен за частые сообщения."
+                )
+                # Очищаем данные пользователя после мутирования
+                user_message_data.pop(user_id, None)
+                user_warnings.pop(user_id, None)
+            except Exception as e:
+                logger.warning(f"Не удалось замутить пользователя: {e}")
+
+# Обработчик для управления заблокированными типами сообщений
+async def manage_locked_types(update: Update, context) -> None:
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    message_text = update.message.text
+
+    admins = await context.bot.get_chat_administrators(chat_id)
+    admin_ids = [admin.user.id for admin in admins]
+
+    if user_id not in admin_ids:
+        await update.message.reply_text("Эта команда доступна только администраторам.")
+        return
+
+    if message_text.startswith("+лок") or message_text.startswith("-лок"):
+        command, type_of_message = message_text.split(maxsplit=1)
+        type_of_message = type_of_message.lower()
+
+        if type_of_message in locked_message_types:
+            if command == "+лок":
+                locked_message_types[type_of_message] = True
+                await update.message.reply_text(f"Тип сообщений '{type_of_message}' успешно заблокирован.")
+            elif command == "-лок":
+                locked_message_types[type_of_message] = False
+                await update.message.reply_text(f"Тип сообщений '{type_of_message}' успешно разблокирован.")
         else:
-            del banned_users[user_id]
+            await update.message.reply_text(
+                "Неверный тип сообщения. Доступные типы: фото, стикер, аудио, видео, документ, текст."
+            )
 
-    if user_id in last_message_time:
-        time_since_last_message = current_time - last_message_time[user_id]
-        if time_since_last_message < timedelta(seconds=50):
-            new_ban_until = current_time + timedelta(hours=1)
-            banned_until = banned_users.get(user_id, (current_time, current_time))
-            if new_ban_until > banned_until[1]:
-                banned_users[user_id] = (current_time, new_ban_until)
-                await update.message.reply_text("Слишком часто. Блокировка на 1 час.")
+# Проверка заблокированных типов сообщений
+async def check_locked_message(update: Update, context) -> None:
+    if update.message.photo and locked_message_types.get("photo", False):
+        try:
+            await update.message.delete()
+        except Exception as e:
+            logger.warning(f"Не удалось удалить сообщение: {e}")
+
+    if update.message.sticker and locked_message_types.get("sticker", False):
+        try:
+            await update.message.delete()
+        except Exception as e:
+            logger.warning(f"Не удалось удалить сообщение: {e}")
+
+    if update.message.audio and locked_message_types.get("audio", False):
+        try:
+            await update.message.delete()
+        except Exception as e:
+            logger.warning(f"Не удалось удалить сообщение: {e}")
+
+    if update.message.video and locked_message_types.get("video", False):
+        try:
+            await update.message.delete()
+        except Exception as e:
+            logger.warning(f"Не удалось удалить сообщение: {e}")
+
+    if update.message.document and locked_message_types.get("document", False):
+        try:
+            await update.message.delete()
+        except Exception as e:
+            logger.warning(f"Не удалось удалить сообщение: {e}")
+
+    if update.message.text and locked_message_types.get("text", False):
+        try:
+            await update.message.delete()
+        except Exception as e:
+            logger.warning(f"Не удалось удалить сообщение: {e}")
+
+# Автоматические сообщения
+async def auto_message(update: Update, context) -> None:
+    if update.message.text.startswith("!авто"):
+        message = update.message.text.split(" ", 2)
+        if len(message) < 3:
+            await update.message.reply_text("Неверный формат команды. Пример: !авто <время в секундах> <сообщение>")
             return
 
-    last_message_time[user_id] = current_time
+        try:
+            time_interval = int(message[1])
+            text = message[2]
+        except ValueError:
+            await update.message.reply_text("Некорректное время.")
+            return
 
-    sent = False
+        auto_messages[update.effective_chat.id].append((time_interval, text))
+        await update.message.reply_text(f"Сообщение будет отправлено каждые {time_interval} секунд: {text}")
 
-    async def send_confirmation(success):
-        if success and user_id not in confirmation_sent:
-            await update.message.reply_text("✉️")
-            confirmation_sent.add(user_id)
-        elif not success:
-            await update.message.reply_text("❌")
+        # Функция отправки авто-сообщений
+        async def send_auto_message():
+            while True:
+                for auto_message in auto_messages[update.effective_chat.id]:
+                    await context.bot.send_message(chat_id=update.effective_chat.id, text=auto_message[1])
+                    await asyncio.sleep(auto_message[0])
 
-    async def analyze_image(image_url):
-        analysis = computervision_client.analyze_image(image_url, visual_features=["Adult"])
-        return analysis.adult.is_adult_content or analysis.adult.is_racy_content
+        if update.effective_chat.id not in auto_job_handles:
+            job_handle = asyncio.create_task(send_auto_message())
+            auto_job_handles[update.effective_chat.id] = job_handle
 
-    try:
-        if update.message.text:
-            user_requests[user_id] = user_requests.get(user_id, 0) + 1
-            await context.bot.send_message(chat_id=ADMIN_ID, text=f"Запрос от {user_name} (@{username}, ID: {user_id}):\n\n{update.message.text}")
-            sent = True
-        elif update.message.photo:
-            user_requests[user_id] = user_requests.get(user_id, 0) + 1
-            photo = update.message.photo[-1]
-            photo_file = await context.bot.get_file(photo.file_id)
-            photo_url = photo_file.file_path
-            if await analyze_image(photo_url):
-                await update.message.reply_text("Нежелательный контент. Заблокированы на 1 день.")
-                banned_users[user_id] = (current_time, current_time + timedelta(days=1))
-                await update.message.reply_text("Вот песня для вас: https://youtu.be/ShmpspBio7U?si=0jJy_0ffQyqJRqs2")
-            else:
-                await context.bot.send_photo(chat_id=ADMIN_ID, photo=photo.file_id, caption=f"{user_name} (@{username}, ID: {user_id}) отправил фото.")
-                sent = True
-        elif update.message.animation:
-            user_requests[user_id] = user_requests.get(user_id, 0) + 1
-            animation = update.message.animation
-            await context.bot.send_animation(chat_id=ADMIN_ID, animation=animation.file_id, caption=f"{user_name} (@{username}, ID: {user_id}) отправил GIF.")
-            sent = True
-        elif update.message.sticker:
-            user_requests[user_id] = user_requests.get(user_id, 0) + 1
-            sticker = update.message.sticker
-            await context.bot.send_sticker(chat_id=ADMIN_ID, sticker=sticker.file_id, caption=f"{user_name} (@{username}, ID: {user_id}) отправил стикер.")
-            sent = True
-    except Exception as e:
-        logging.error(f"Ошибка: {e}")
-    
-    await send_confirmation(sent)
-
-    if not sent:
-        await asyncio.sleep(72 * 60 * 60)
-        await send_confirmation(False)
-
-async def stats(update: Update, context: CallbackContext):
-    if update.message.from_user.id != ADMIN_ID:
-        await update.message.reply_text("Нет доступа.")
-        return
-
-    stats_message = "Статистика:\n"
-    for user_id, count in user_requests.items():
-        stats_message += f"{user_id}: {count} запросов\n"
-
-    await update.message.reply_text(stats_message)
-
-async def reset(update: Update, context: CallbackContext):
-    if update.message.from_user.id != ADMIN_ID:
-        await update.message.reply_text("Нет доступа.")
-        return
-
-    user_requests.clear()
-    confirmation_sent.clear()
-    last_message_time.clear()
-    banned_users.clear()
-    
-    await update.message.reply_text("Данные сброшены.")
-
-async def broadcast(update: Update, context: CallbackContext):
-    if update.message.from_user.id != ADMIN_ID:
-        await update.message.reply_text("Нет доступа.")
-        return
-
-    message = " ".join(context.args)
-    if not message:
-        await update.message.reply_text("Укажите сообщение.")
-        return
-
-    for user_id in user_requests.keys():
-        await context.bot.send_message(chat_id=user_id, text=message)
-
-    await update.message.reply_text("Уведомления отправлены.")
-
-def main():
+# Основная функция
+async def main() -> None:
     application = Application.builder().token(TOKEN).build()
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_feedback))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, anti_spam))
+    application.add_handler(MessageHandler(filters.COMMAND, manage_locked_types))
+    application.add_handler(MessageHandler(filters.ALL, check_locked_message))
+
+    application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^!авто"), auto_message))
+
+    # Запуск polling для получения сообщений
+    async def manage_locked_types(update: Update, context) -> None:
+    """Handle lock and unlock commands from admins."""
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    message_text = update.message.text
+
+    # Check if the user is an admin
+    admins = await context.bot.get_chat_administrators(chat_id)
+    admin_ids = [admin.user.id for admin in admins]
+
+    if user_id not in admin_ids:
+        await update.message.reply_text("Эта команда доступна только администраторам.")
+        return
+
+    if message_text.startswith("+лок") or message_text.startswith("-лок"):
+        command, type_of_message = message_text.split(maxsplit=1)
+        type_of_message = type_of_message.lower()
+
+        if type_of_message in locked_message_types:
+            if command == "+лок":
+                locked_message_types[type_of_message] = True
+                await update.message.reply_text(f"Тип сообщений '{type_of_message}' успешно заблокирован.")
+            elif command == "-лок":
+                locked_message_types[type_of_message] = False
+                await update.message.reply_text(f"Тип сообщений '{type_of_message}' успешно разблокирован.")
+        else:
+            await update.message.reply_text(
+                "Неверный тип сообщения. Доступные типы: фото, стикер, аудио, видео, документ, текст."
+            )
+
+
+async def check_locked_message(update: Update, context) -> None:
+    """Check if a message should be deleted based on locked message types."""
+    if update.message.photo and locked_message_types.get("photo", False):
+        try:
+            await update.message.delete()
+        except Exception as e:
+            logger.warning(f"Не удалось удалить фото: {e}")
+
+    if update.message.sticker and locked_message_types.get("sticker", False):
+        try:
+            await update.message.delete()
+        except Exception as e:
+            logger.warning(f"Не удалось удалить стикер: {e}")
+
+    if update.message.audio and locked_message_types.get("audio", False):
+        try:
+            await update.message.delete()
+        except Exception as e:
+            logger.warning(f"Не удалось удалить аудио: {e}")
+
+    if update.message.video and locked_message_types.get("video", False):
+        try:
+            await update.message.delete()
+        except Exception as e:
+            logger.warning(f"Не удалось удалить видео: {e}")
+
+    if update.message.document and locked_message_types.get("document", False):
+        try:
+            await update.message.delete()
+        except Exception as e:
+            logger.warning(f"Не удалось удалить документ: {e}")
+
+    if update.message.text and locked_message_types.get("text", False):
+        try:
+            await update.message.delete()
+        except Exception as e:
+            logger.warning(f"Не удалось удалить текст: {e}")
+
+
+def main():
+    application = ApplicationBuilder().token(TOKEN).build()
+
+    application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^\+лок|^-лок"), manage_locked_types))
+    application.add_handler(MessageHandler(filters.ALL, check_locked_message))
 
     application.run_polling()
 
+# Логирование
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+async def summon_all_users(update: Update, context: CallbackContext) -> None:
+    """Вызвать всех пользователей, кроме администраторов."""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+
+    # Проверка, является ли пользователь администратором
+    admins = [admin.user.id for admin in await context.bot.get_chat_administrators(chat_id)]
+    if user_id not in admins:
+        await update.message.reply_text("Эта команда доступна только администраторам.")
+        return
+
+    try:
+        # Получение всех участников чата
+        members = await context.bot.get_chat_members(chat_id)
+        for member in members:
+            if member.user.id not in admins:  # Исключаем администраторов
+                try:
+                    await context.bot.send_message(member.user.id, "Внимание! Вас вызывает админ!")
+                except Exception as e:
+                    logger.error(f"Ошибка при вызове пользователя {member.user.id}: {e}")
+        await update.message.reply_text("Все пользователи (кроме администраторов) были вызваны!")
+
+    except Exception as e:
+        logger.error(f"Ошибка при получении участников чата: {e}")
+        await update.message.reply_text("Произошла ошибка при вызове участников.")
+
+async def summon_admins(update: Update, context: CallbackContext) -> None:
+    """Вызвать только администраторов чата."""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+
+    # Проверка, является ли пользователь администратором
+    admins = [admin.user.id for admin in await context.bot.get_chat_administrators(chat_id)]
+    if user_id not in admins:
+        await update.message.reply_text("Эта команда доступна только администраторам.")
+        return
+
+    try:
+        # Получение всех администраторов
+        for admin_id in admins:
+            try:
+                await context.bot.send_message(admin_id, "Внимание! Вас вызывает админ!")
+            except Exception as e:
+                logger.error(f"Ошибка при вызове администратора {admin_id}: {e}")
+        await update.message.reply_text("Все администраторы были вызваны!")
+
+    except Exception as e:
+        logger.error(f"Ошибка при получении администраторов чата: {e}")
+        await update.message.reply_text("Произошла ошибка при вызове администраторов.")
+
+def add_summon_handlers(application) -> None:
+    """Добавить обработчики команд вызова."""
+    application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"\+Созыв"), summon_all_users))
+    application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"\+Созывэлиты"), summon_admins))
+
+async def main() -> None:
+    """Основная функция запуска бота."""
+    application = ApplicationBuilder().token("YOUR_BOT_TOKEN").build()
+
+    # Добавляем обработчики команд
+    add_summon_handlers(application)
+
+    from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackContext
+import logging
+
+# Логирование
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Структура для хранения ролей
+roles = {}
+
+async def add_role(update: Update, context: CallbackContext) -> None:
+    """Добавление новой роли."""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+
+    # Проверка, является ли пользователь администратором
+    admins = [admin.user.id for admin in await context.bot.get_chat_administrators(chat_id)]
+    if user_id not in admins:
+        await update.message.reply_text("Эта команда доступна только администраторам.")
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text("Неверный формат команды. Пример: +Роль <название роли> <сообщение>")
+        return
+
+    role_name = context.args[0]
+    role_message = " ".join(context.args[1:])
+
+    if role_name in roles:
+        await update.message.reply_text(f"Роль '{role_name}' уже существует.")
+        return
+
+    # Добавляем роль в структуру
+    roles[role_name] = role_message
+    await update.message.reply_text(f"Роль '{role_name}' была успешно создана!")
+
+async def assign_role(update: Update, context: CallbackContext) -> None:
+    """Назначение роли пользователю по его @username."""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+
+    if len(context.args) < 2:
+        await update.message.reply_text("Неверный формат команды. Пример: +НазначитьРоль @username <название роли>")
+        return
+
+    username = context.args[0].lstrip('@')  # Убираем @ перед username
+    role_name = context.args[1]
+
+    if role_name not in roles:
+        await update.message.reply_text(f"Роль '{role_name}' не существует.")
+        return
+
+    # Поиск пользователя по username
+    try:
+        target_user = await context.bot.get_chat_member(chat_id, username)
+    except Exception as e:
+        logger.warning(f"Не удалось найти пользователя с username {username}: {e}")
+        await update.message.reply_text(f"Не удалось найти пользователя с username @{username}.")
+        return
+
+    # Назначаем роль пользователю
+    role_message = roles[role_name]
+    await context.bot.send_message(target_user.user.id, f"Поздравляем! Вы получили роль: {role_name}\n{role_message}")
+    await update.message.reply_text(f"Роль '{role_name}' была успешно назначена пользователю @{username}.")
+
+async def main() -> None:
+    application = ApplicationBuilder().token("7693473797:AAFTLPjkrIOOSdObSFtBCgKXjRKG3NtBEpg").build()
+
+    # Рекрут 
+    application.add_handler(CommandHandler("роль", add_role))  # Добавление роли
+    application.add_handler(CommandHandler("назначить роль", assign_role))  # Назначение роли
+
+    await application.run_polling()
+
 if __name__ == "__main__":
-    main()
+    import asyncio
+    asyncio.run(main())
